@@ -1,0 +1,42 @@
+[
+  {
+    "id": "sample_01",
+    "text": "the weekly engineering coordination meeting starts right now"
+  },
+  {
+    "id": "sample_02",
+    "text": "the project budget for this quarter has been approved by management"
+  },
+  {
+    "id": "sample_03",
+    "text": "we encountered several technical challenges during server load testing"
+  },
+  {
+    "id": "sample_04",
+    "text": "the product release schedule will be postponed for three business days"
+  },
+  {
+    "id": "sample_05",
+    "text": "the user interface design review has been completed with the client"
+  },
+  {
+    "id": "sample_06",
+    "text": "please ensure all team members document the agreed discussion points"
+  },
+  {
+    "id": "sample_07",
+    "text": "the artificial intelligence system runs completely offline on local machines"
+  },
+  {
+    "id": "sample_08",
+    "text": "the thirty second rolling audio buffer was frozen and saved successfully"
+  },
+  {
+    "id": "sample_09",
+    "text": "are there any additional questions before we conclude today's session"
+  },
+  {
+    "id": "sample_10",
+    "text": "thank you everyone for your attendance and participation in this meeting"
+  }
+]
