@@ -62,6 +62,7 @@ class LocalASREngine:
             audio_data,
             language=target_lang,
             beam_size=5,
+            initial_prompt="Meeting discussion notes and conversation.",
             vad_filter=True,
             vad_parameters=dict(
                 min_speech_duration_ms=250,
@@ -70,8 +71,8 @@ class LocalASREngine:
             ),
             condition_on_previous_text=False,
             temperature=[0.0, 0.2, 0.4],
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.3,
+            no_repeat_ngram_size=0,
+            repetition_penalty=1.0,
             no_speech_threshold=0.6,
             compression_ratio_threshold=2.4,
             hallucination_silence_threshold=1.5
