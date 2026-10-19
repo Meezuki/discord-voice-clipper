@@ -15,12 +15,12 @@ class WERBenchmarkEvaluator:
     def __init__(self, asr_engine=None):
         self.asr_engine = asr_engine or LocalASREngine(model_size="base", device="cpu", compute_type="int8")
 
-    def evaluate_sample(self, audio_data: np.ndarray, reference_text: str):
+    def evaluate_sample(self, audio_data: np.ndarray, reference_text: str, language: str = "en"):
         """
         Evaluates a single audio sample against reference ground truth text.
         """
         duration_sec = len(audio_data) / 16000.0 if len(audio_data) > 0 else 0.0
-        hypothesis_text, latency = self.asr_engine.transcribe(audio_data)
+        hypothesis_text, latency = self.asr_engine.transcribe(audio_data, language=language)
 
         # Text normalization for fair comparison (lowercase, remove punctuation)
         transformation = jiwer.Compose([
@@ -86,8 +86,13 @@ class WERBenchmarkEvaluator:
 
         return md
 
-def load_wav_file(file_path: str) -> np.ndarray:
-    """Reads 16-bit mono 16kHz WAV file into a float32 numpy array."""
+from scipy import signal
+
+def load_wav_file(file_path: str, target_sr: int = 16000) -> np.ndarray:
+    """
+    Reads a WAV file, downmixes stereo to mono if needed,
+    and automatically resamples to target_sr (default 16kHz) float32 normalized to [-1.0, 1.0].
+    """
     with wave.open(file_path, "rb") as wf:
         n_channels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
@@ -97,6 +102,13 @@ def load_wav_file(file_path: str) -> np.ndarray:
     audio_int16 = np.frombuffer(frames, dtype=np.int16)
     if n_channels == 2:
         audio_int16 = audio_int16.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+    # Resample to 16 kHz if original sample rate differs (e.g. 44.1 kHz or 48 kHz)
+    if framerate != target_sr and len(audio_int16) > 0:
+        num_target_samples = int(round(len(audio_int16) * float(target_sr) / framerate))
+        audio_resampled = signal.resample(audio_int16, num_target_samples)
+        return audio_resampled.astype(np.float32) / 32768.0
+
     return audio_int16.astype(np.float32) / 32768.0
 
 if __name__ == "__main__":
@@ -117,7 +129,8 @@ if __name__ == "__main__":
         wav_path = os.path.join(DATASET_DIR, f"{item['id']}.wav")
         if os.path.exists(wav_path):
             audio = load_wav_file(wav_path)
-            res = evaluator.evaluate_sample(audio, item["text"])
+            target_lang = item.get("language", "en")
+            res = evaluator.evaluate_sample(audio, item["text"], language=target_lang)
             all_results.append(res)
             print(f"[{item['id']}] Latency: {res['latency_sec']:.2f}s | WER: {res['wer'] * 100:.1f}%")
 

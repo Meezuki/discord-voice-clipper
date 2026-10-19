@@ -47,3 +47,27 @@ def test_markdown_report_generation():
     assert "Real-Time Factor" in report
     assert "hello everyone" in report
 
+def test_load_wav_file_resampling(tmp_path):
+    """Verify that load_wav_file correctly resamples 44.1kHz stereo to 16kHz mono float32."""
+    import wave
+    from evaluate_wer import load_wav_file
+
+    wav_file = tmp_path / "test_44k.wav"
+    sr = 44100
+    duration = 1.0  # 1 second = 44100 samples
+    samples = (np.sin(2 * np.pi * 440 * np.linspace(0, duration, sr)) * 10000).astype(np.int16)
+    stereo_samples = np.column_stack((samples, samples)).flatten()
+
+    with wave.open(str(wav_file), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(stereo_samples.tobytes())
+
+    loaded = load_wav_file(str(wav_file), target_sr=16000)
+    assert isinstance(loaded, np.ndarray)
+    assert loaded.dtype == np.float32
+    # 1.0 second at 16000 Hz should yield approximately 16000 samples
+    assert abs(len(loaded) - 16000) <= 2
+
+

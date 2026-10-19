@@ -9,9 +9,9 @@ def test_keyword_spotter_debounce():
     spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
     spotter.recognizer = MagicMock()
 
-    # Simulate detecting "bot record"
+    # Simulate detecting "bot clip that"
     spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "please bot record this"}'
+    spotter.recognizer.Result.return_value = '{"text": "please bot clip that"}'
 
     dummy_pcm = b"\x00" * 3200 # 100ms audio chunk
     detected1 = spotter.process_chunk(dummy_pcm)
@@ -26,34 +26,38 @@ def test_keyword_spotter_debounce():
     detected3 = spotter.process_chunk(dummy_pcm)
     assert detected3 is True
 
-def test_keyword_spotter_record_phrase():
-    """Verify that saying just 'record' also triggers the wake word."""
+def test_keyword_spotter_bot_word_alone_does_not_trigger():
+    """Verify that saying just 'bot' or 'paper clip' does NOT trigger the wake word."""
     spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
     spotter.recognizer = MagicMock()
 
     spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "record"}'
+    spotter.recognizer.Result.return_value = '{"text": "hey bot"}'
 
     dummy_pcm = b"\x00" * 3200
     detected = spotter.process_chunk(dummy_pcm)
-    assert detected is True
+    assert detected is False
 
-def test_keyword_spotter_but_record_phonetic_variant():
-    """Verify that acoustic variant 'but record' triggers the wake word."""
+    # Also non-command 'paper clip' should not trigger
+    spotter.recognizer.Result.return_value = '{"text": "bring me a paper clip"}'
+    assert spotter.process_chunk(dummy_pcm) is False
+
+def test_keyword_spotter_clip_that_trigger():
+    """Verify that intentional phrase 'bot clip that' triggers the wake word."""
     spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
     spotter.recognizer = MagicMock()
 
     spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "but record"}'
+    spotter.recognizer.Result.return_value = '{"text": "bot clip that"}'
 
     dummy_pcm = b"\x00" * 3200
     detected = spotter.process_chunk(dummy_pcm)
     assert detected is True
 
 def test_keyword_spotter_whisper_fallback():
-    """Verify that when Vosk returns unk or empty, Whisper spotter fallback catches 'record'."""
+    """Verify that when Vosk returns unk or empty, Whisper spotter fallback catches 'bot clip that'."""
     mock_asr = MagicMock()
-    mock_asr.transcribe.return_value = ("hello everyone please record now", 0.05)
+    mock_asr.transcribe.return_value = ("hello everyone please bot clip that now", 0.05)
 
     spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
     spotter.recognizer = MagicMock()
@@ -64,9 +68,7 @@ def test_keyword_spotter_whisper_fallback():
     spotter.last_whisper_check = 0.0
 
     # Ingest enough audio to exceed whisper_samples_target (e.g. 2.5s with non-zero sound)
-    # 2.5s = 25 chunks @ 100ms (1600 samples)
     detected = False
-    # Non-silent chunk
     chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
     for _ in range(26):
         if spotter.process_chunk(chunk):
@@ -87,4 +89,55 @@ def test_keyword_spotter_ignores_non_trigger_words():
     dummy_pcm = b"\x00" * 3200
     detected = spotter.process_chunk(dummy_pcm)
     assert detected is False
+
+def test_keyword_spotter_two_stage_verification_rejects_false_positive():
+    """Verify that if Vosk misrecognizes conversational speech as a trigger, Whisper verification rejects it."""
+    mock_asr = MagicMock()
+    # Whisper reveals user actually said conversational speech without any clip command
+    mock_asr.transcribe.return_value = ("what is listening in the voice channel general", 0.05)
+
+    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
+    spotter.recognizer = MagicMock()
+    spotter.recognizer.AcceptWaveform.return_value = True
+    # Vosk erroneously heard 'clip'
+    spotter.recognizer.Result.return_value = '{"text": "clip"}'
+
+    # Provide audible chunk so verification evaluates
+    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
+    detected = spotter.process_chunk(chunk)
+
+    assert detected is False  # Suppressed by Whisper verification!
+    mock_asr.transcribe.assert_called()
+
+def test_keyword_spotter_two_stage_verification_confirms_true_positive():
+    """Verify that if Vosk detects trigger and Whisper confirms it, the trigger fires."""
+    mock_asr = MagicMock()
+    mock_asr.transcribe.return_value = ("please bot clip that meeting", 0.05)
+
+    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
+    spotter.recognizer = MagicMock()
+    spotter.recognizer.AcceptWaveform.return_value = True
+    spotter.recognizer.Result.return_value = '{"text": "bot clip that"}'
+
+    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
+    detected = spotter.process_chunk(chunk)
+
+    assert detected is True  # Confirmed!
+    mock_asr.transcribe.assert_called()
+
+def test_keyword_spotter_whisper_punctuation_handling():
+    """Verify that Whisper output containing punctuation like 'Bot, clip that.' triggers properly."""
+    mock_asr = MagicMock()
+    mock_asr.transcribe.return_value = ("Bot, clip that.", 0.05)
+
+    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
+    spotter.recognizer = MagicMock()
+    spotter.recognizer.AcceptWaveform.return_value = True
+    spotter.recognizer.Result.return_value = '{"text": "bot clip that"}'
+
+    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
+    detected = spotter.process_chunk(chunk)
+
+    assert detected is True
+
 

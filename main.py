@@ -11,7 +11,7 @@ from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 import numpy as np
 
-from audio_sink import SynchronizedRollingSink, SpeechSegmenter
+from audio_sink import SynchronizedRollingSink
 from asr_engine import LocalASREngine
 from keyword_spotter import KeywordSpotter
 from download_model import EXTRACTED_PATH, ensure_vosk_model
@@ -105,16 +105,17 @@ asr_engine = LocalASREngine(model_size="base", device="cpu", compute_type="int8"
 active_sinks = {}
 active_spotters = {}
 active_text_channels = {}
+active_languages = {}  # guild_id -> 'en' | 'id' | 'auto'
 
 @bot.event
 async def on_ready():
     logger.info(f"Bot connected as {bot.user} (ID: {bot.user.id})")
     await asyncio.to_thread(ensure_vosk_model)
 
-async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: 'bot record'"):
+async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: 'bot clip that'"):
     """
     Freezes the last 30s buffer, transcribes locally via background worker,
-    and sends structured meeting minutes with a WAV attachment to Discord.
+    and sends structured meeting minutes / voice clip with a WAV attachment to Discord.
     """
     sink = active_sinks.get(guild_id)
     text_channel = active_text_channels.get(guild_id)
@@ -133,8 +134,10 @@ async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: '
 
     processing_msg = await text_channel.send("⏳ **Freezing 30-second buffer & transcribing locally...**")
 
-    # Run local English ASR in non-blocking worker thread
-    text, latency = await asyncio.to_thread(asr_engine.transcribe, audio_data, "en")
+    # Run local multilingual ASR with guild-selected language (defaults to 'en', or 'id' / 'auto')
+    guild_lang = active_languages.get(guild_id, "en")
+    lang_param = None if guild_lang == "auto" else guild_lang
+    text, latency = await asyncio.to_thread(asr_engine.transcribe, audio_data, lang_param)
 
     if not text.strip():
         text = "*(No intelligible speech detected)*"
@@ -143,7 +146,7 @@ async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: '
     time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     embed = discord.Embed(
-        title="🎙️ Instant Meeting Minutes (Last 30 Seconds)",
+        title="🎬 Instant Voice Clip (Last 30 Seconds)",
         description="The last 30 seconds of audio were captured and transcribed completely offline.",
         color=discord.Color.brand_green()
     )
@@ -154,7 +157,7 @@ async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: '
     embed.set_footer(text="Discord Voice Clipper • Offline Local ASR & KWS")
 
     wav_io = io.BytesIO(wav_bytes)
-    file_attachment = discord.File(fp=wav_io, filename=f"minutes_{timestamp_now}.wav")
+    file_attachment = discord.File(fp=wav_io, filename=f"clip_{timestamp_now}.wav")
 
     try:
         await processing_msg.delete()
@@ -162,85 +165,10 @@ async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: '
         pass
 
     await text_channel.send(embed=embed, file=file_attachment)
-    logger.info(f"Meeting minutes sent to #{text_channel.name} (Guild: {guild_id})")
-
-# Real-time live transcription state per guild
-realtime_enabled = {}
-realtime_messages = {}
-realtime_lines = {}
-realtime_segmenters = {}
-realtime_last_edit = {}
-realtime_pending_update = {}
-
-async def trigger_embed_update(guild_id: int):
-    msg = realtime_messages.get(guild_id)
-    if not msg or not realtime_enabled.get(guild_id, False):
-        return
-
-    now = time.time()
-    last_edit = realtime_last_edit.get(guild_id, 0.0)
-
-    # Respect Discord rate limit (max 1 edit per 1.2s)
-    if now - last_edit < 1.2:
-        if not realtime_pending_update.get(guild_id, False):
-            realtime_pending_update[guild_id] = True
-            await asyncio.sleep(1.2 - (now - last_edit))
-            realtime_pending_update[guild_id] = False
-            await trigger_embed_update(guild_id)
-        return
-
-    realtime_last_edit[guild_id] = now
-    lines = list(realtime_lines.get(guild_id, []))
-    content = "\n\n".join(lines) if lines else "*(Listening for speech...)*"
-
-    embed = discord.Embed(
-        title="🔴 Live Meeting Transcription",
-        description=content,
-        color=discord.Color.red()
-    )
-    embed.set_footer(text="Discord Voice Clipper • Live Subtitles Active (Last 5 sentences)")
-    try:
-        await msg.edit(embed=embed)
-    except Exception as e:
-        logger.debug(f"Failed to edit live embed: {e}")
-
-def make_speech_segment_callback(guild_id: int):
-    """Callback when SpeechSegmenter flushes an active sentence segment."""
-    def on_speech_segment(user_id, speaker_name, audio_float32):
-        if not realtime_enabled.get(guild_id, False):
-            return
-
-        def transcribe_and_update():
-            text, _ = asr_engine.transcribe(audio_float32, language="en")
-            text = text.strip()
-            if not text:
-                return
-
-            clean_lower = text.lower()
-            # If the user spoke a wake word, trigger minutes snapshot
-            if any(w in clean_lower for w in ["bot record", "record", "but record"]):
-                logger.info(f"Wake word detected inside real-time stream: '{clean_lower}'")
-                asyncio.run_coroutine_threadsafe(
-                    process_and_send_notula(guild_id, trigger_source=f"Realtime: '{clean_lower}'"),
-                    bot.loop
-                )
-                return
-
-            ts = int(time.time())
-            line = f"<t:{ts}:T> **{speaker_name}**: \"{text}\""
-            if guild_id not in realtime_lines:
-                realtime_lines[guild_id] = collections.deque(maxlen=5)
-            realtime_lines[guild_id].append(line)
-            logger.info(f"💬 [Realtime Subtitle]: {speaker_name}: \"{text}\"")
-
-            asyncio.run_coroutine_threadsafe(trigger_embed_update(guild_id), bot.loop)
-
-        threading.Thread(target=transcribe_and_update, daemon=True).start()
-
-    return on_speech_segment
+    logger.info(f"Voice clip sent to #{text_channel.name} (Guild: {guild_id})")
 
 def make_keyword_callback(guild_id: int):
-    """Callback when Vosk detects 'bot record' or 'record'."""
+    """Callback when wake word 'bot clip that' is detected."""
     def on_trigger(recognized_phrase):
         logger.info(f"Trigger received in guild {guild_id}: '{recognized_phrase}'")
         asyncio.run_coroutine_threadsafe(
@@ -262,33 +190,21 @@ async def join(ctx):
     # Store origin text channel for minutes dispatch
     active_text_channels[guild_id] = ctx.channel
 
-    # Dual-Engine English Keyword Spotter: Grammar-Constrained Vosk + Rolling Whisper Fallback
+    # Two-Stage Keyword Spotter: Open-Vocabulary Vosk + Faster-Whisper Verification
     spotter = KeywordSpotter(
         model_path=EXTRACTED_PATH,
-        target_phrases=["bot record", "record", "but record", "boat record", "recording", "start record"],
+        target_phrases=["bot clip that", "clip that", "bot clip this", "please clip that"],
         cooldown_seconds=8.0,
         trigger_callback=make_keyword_callback(guild_id),
         asr_engine=asr_engine
     )
     active_spotters[guild_id] = spotter
 
-    # Speech Segmenter for Real-Time Live Subtitles
-    segmenter = SpeechSegmenter(
-        segment_callback=make_speech_segment_callback(guild_id),
-        speech_threshold=0.012,
-        silence_timeout_sec=0.7,
-        min_duration_sec=0.8
-    )
-    realtime_segmenters[guild_id] = segmenter
-    realtime_enabled[guild_id] = False
-    realtime_lines[guild_id] = collections.deque(maxlen=5)
-
-    # Rolling Audio Sink with 100ms streaming chunk feed to Vosk and segmenter hook
+    # Rolling Audio Sink with 100ms streaming chunk feed to KWS
     sink = SynchronizedRollingSink(
         buffer_seconds=30,
         chunk_callback=spotter.process_chunk,
-        chunk_ms=100,
-        segmenter=segmenter
+        chunk_ms=100
     )
     active_sinks[guild_id] = sink
 
@@ -300,71 +216,17 @@ async def join(ctx):
     vc.listen(sink)
 
     embed = discord.Embed(
-        title="🎙️ Meeting Assistant Active",
+        title="🎙️ Meeting Voice Clipper Active",
         description=(
             f"Bot is listening in voice channel `{channel.name}`.\n\n"
-            f"**How to Capture Meeting Minutes:**\n"
-            f"• Say the wake word: **`\"bot record\"`** or **`\"record\"`**\n"
+            f"**How to Capture Audio Clips:**\n"
+            f"• Say the wake word: **`\"bot clip that\"`**\n"
             f"• Or use text command: **`!clip`**\n\n"
-            f"**Live Speech Subtitles:**\n"
-            f"• Start live transcription: **`!realtime on`** *(or `!live on`)*\n"
-            f"• Stop live transcription: **`!realtime off`**\n\n"
-            f"Meeting minutes and the 30-second WAV clip will be sent automatically to #{ctx.channel.name}."
+            f"The 30-second audio clip and transcription will be sent to #{ctx.channel.name}."
         ),
         color=discord.Color.blurple()
     )
     await ctx.send(embed=embed)
-
-@bot.command(name="realtime", aliases=["live"], help="Toggle live speech-to-text subtitles in chat: !realtime on | !realtime off | !realtime status")
-async def realtime(ctx, mode: str = "status"):
-    guild_id = ctx.guild.id
-    mode = mode.lower().strip()
-
-    if guild_id not in active_sinks:
-        await ctx.send("❌ Bot is not currently listening in a voice channel. Use `!join` first.")
-        return
-
-    if mode in ["on", "start", "enable"]:
-        if realtime_enabled.get(guild_id, False) and realtime_messages.get(guild_id):
-            await ctx.send("ℹ️ Real-time live subtitles are already enabled.")
-            return
-
-        realtime_enabled[guild_id] = True
-        embed = discord.Embed(
-            title="🔴 Live Meeting Transcription",
-            description="*(Listening for speech...)*",
-            color=discord.Color.red()
-        )
-        embed.set_footer(text="Discord Voice Clipper • Live Subtitles Active (Last 5 sentences)")
-        msg = await ctx.channel.send(embed=embed)
-        realtime_messages[guild_id] = msg
-        realtime_last_edit[guild_id] = time.time()
-        await ctx.send("✅ **Live Subtitles enabled!** As participants speak, the embed above will update in real-time.")
-
-    elif mode in ["off", "stop", "disable"]:
-        realtime_enabled[guild_id] = False
-        msg = realtime_messages.get(guild_id)
-        if msg:
-            lines = list(realtime_lines.get(guild_id, []))
-            content = "\n\n".join(lines) if lines else "*(Session paused)*"
-            embed = discord.Embed(
-                title="⚪ Live Meeting Transcription (Paused)",
-                description=content,
-                color=discord.Color.light_grey()
-            )
-            embed.set_footer(text="Discord Voice Clipper • Live Subtitles Paused")
-            try:
-                await msg.edit(embed=embed)
-            except Exception:
-                pass
-        await ctx.send("⏹️ Real-time live subtitles disabled.")
-
-    elif mode == "status":
-        is_on = realtime_enabled.get(guild_id, False)
-        status_str = "🟢 **ENABLED**" if is_on else "⚪ **DISABLED**"
-        await ctx.send(f"📊 Real-time live subtitles: {status_str}\nUse `!realtime on` or `!realtime off` to change.")
-    else:
-        await ctx.send("❌ Invalid option. Use `!realtime on`, `!realtime off`, or `!realtime status`.")
 
 @bot.command(name="clip", help="Manually freeze and transcribe the last 30 seconds of audio.")
 async def clip(ctx):
@@ -375,6 +237,23 @@ async def clip(ctx):
 
     active_text_channels[guild_id] = ctx.channel
     await process_and_send_notula(guild_id, trigger_source=f"Command: !clip by {ctx.author.display_name}")
+
+@bot.command(name="lang", aliases=["language"], help="Sets transcription language ('en', 'id', or 'auto').")
+async def set_language(ctx, lang_code: str = None):
+    guild_id = ctx.guild.id
+    if not lang_code:
+        current = active_languages.get(guild_id, "en")
+        await ctx.send(f"🌐 Current transcription language is: `{current}`. Use `!lang en`, `!lang id`, or `!lang auto` to change.")
+        return
+
+    lang_code = lang_code.lower().strip()
+    if lang_code not in ["en", "id", "auto"]:
+        await ctx.send("❌ Unsupported language! Please choose `en` (English), `id` (Indonesian), or `auto`.")
+        return
+
+    active_languages[guild_id] = lang_code
+    names = {"en": "English", "id": "Indonesian (Bahasa Indonesia)", "auto": "Auto-Detect (English / Indonesian)"}
+    await ctx.send(f"✅ Transcription language set to **{names[lang_code]}** (`{lang_code}`).")
 
 @bot.command(name="leave", help="Disconnects bot from voice channel and frees buffers.")
 async def leave(ctx):
@@ -388,31 +267,8 @@ async def leave(ctx):
             del active_spotters[guild_id]
         if guild_id in active_text_channels:
             del active_text_channels[guild_id]
-        if guild_id in realtime_enabled:
-            msg = realtime_messages.get(guild_id)
-            if msg:
-                try:
-                    embed = discord.Embed(
-                        title="⚪ Live Meeting Transcription (Ended)",
-                        description="\n\n".join(list(realtime_lines.get(guild_id, []))) or "*(Meeting closed)*",
-                        color=discord.Color.light_grey()
-                    )
-                    embed.set_footer(text="Discord Voice Clipper • Session Ended")
-                    await msg.edit(embed=embed)
-                except Exception:
-                    pass
-            del realtime_enabled[guild_id]
-        if guild_id in realtime_messages:
-            del realtime_messages[guild_id]
-        if guild_id in realtime_lines:
-            del realtime_lines[guild_id]
-        if guild_id in realtime_segmenters:
-            del realtime_segmenters[guild_id]
-        if guild_id in realtime_last_edit:
-            del realtime_last_edit[guild_id]
-        if guild_id in realtime_pending_update:
-            del realtime_pending_update[guild_id]
-
+        if guild_id in active_languages:
+            del active_languages[guild_id]
         await ctx.send("👋 Bot left the voice channel and cleared all audio buffers.")
     else:
         await ctx.send("Bot is not in a voice channel.")

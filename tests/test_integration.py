@@ -36,7 +36,7 @@ async def test_end_to_end_pipeline_simulation():
     file_att = final_call_kwargs.get("file")
 
     assert embed is not None
-    assert "Instant Meeting Minutes" in embed.title
+    assert "Instant Voice Clip" in embed.title
     assert file_att is not None
-    assert file_att.filename.endswith(".wav")
+    assert file_att.filename.startswith("clip_") and file_att.filename.endswith(".wav")
 
