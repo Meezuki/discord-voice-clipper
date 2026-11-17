@@ -5,7 +5,7 @@
 [![Discord.py](https://img.shields.io/badge/Discord.py-2.7-blurple.svg)](https://discordpy.readthedocs.io/)
 [![Faster-Whisper](https://img.shields.io/badge/ASR-faster--whisper%20(int8)-green.svg)](https://github.com/SYSTRAN/faster-whisper)
 [![ONNX KWS](https://img.shields.io/badge/KWS-Trained%20BiGRU%20ONNX%20(1.25ms)-orange.svg)](evaluation_wakeword_report.md)
-[![Tests](https://img.shields.io/badge/Tests-22%2F22%20Passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-28%2F28%20Passed-brightgreen.svg)](tests/)
 [![WER](https://img.shields.io/badge/ASR%20Benchmark%20WER-4.90%25-success.svg)](evaluation_report.md)
 
 ---
@@ -31,6 +31,7 @@ The bot continuously spots the wake word locally using a **custom-trained PyTorc
 - **⚡ 100% Offline Local ASR:** Powered by `faster-whisper` (CTranslate2 int8 quantization) with an average inference latency of **0.43 seconds** on CPU (Real-Time Factor: **0.073x**).
 - **🛡️ Anti-Hallucination & Silence Guards:** Integrated Silero VAD, `condition_on_previous_text=False`, compression ratio checks, and temperature fallback `[0.0, 0.2, 0.4]` eliminate repetition loops.
 - **🌐 Bilingual Support:** Native transcription for **English (`en`)** and **Indonesian (`id`)**, switchable on the fly via `!lang`.
+- **🖥️ Desktop Launcher GUI (`gui.py` + `LaunchBot.bat`):** Dark-slate `tkinter` desktop app to configure `DISCORD_TOKEN`, default duration (`30s`–`30m`), language, and local-save mode, start/stop the bot cleanly with no terminal needed, and view live clip transcripts and system logs.
 - **🔒 Zero Cloud APIs & 100% Privacy:** Zero external speech API calls (no OpenAI API, Google Cloud, or Azure).
 
 ---
@@ -159,6 +160,10 @@ See [RECORD_INSTRUCTIONS.md](file:///d:/dev/discord-voice-clipper/RECORD_INSTRUC
 
 ### 1. Launch the Bot
 
+**Option A — Desktop GUI (Recommended):**
+Double-click **[LaunchBot.bat](file:///d:/dev/discord-voice-clipper/LaunchBot.bat)** (or run `.\venv\Scripts\pythonw.exe gui.py`) to open the dark-slate launcher, configure your `DISCORD_TOKEN` / buffer duration / language / local-save settings, click **Start Bot**, and monitor live clips and transcripts.
+
+**Option B — Terminal CLI:**
 ```powershell
 .\venv\Scripts\python.exe main.py
 ```
@@ -180,7 +185,7 @@ See [RECORD_INSTRUCTIONS.md](file:///d:/dev/discord-voice-clipper/RECORD_INSTRUC
 ## 🧪 Running Automated Tests
 
 ```powershell
-# Run full unit & integration test suite (22/22 tests)
+# Run full unit & integration test suite (28/28 tests)
 .\venv\Scripts\python.exe -m pytest tests/ -v
 
 # Run ASR WER benchmark
@@ -204,6 +209,8 @@ discord-voice-clipper/
 ├── train_wakeword.py                # PyTorch BiGRU-Attention trainer, LOSO CV & ONNX exporter
 ├── evaluate_wakeword.py             # Quantitative wake-word evaluation (Baseline, E1–E5)
 ├── keyword_spotter.py               # Streaming ONNX wake-word spotter ('bot clip that')
+├── gui.py                           # Dark-slate Tkinter desktop launcher, config manager & live clip viewer
+├── LaunchBot.bat                    # Windows double-click GUI launcher (no console window)
 ├── main.py                          # Discord.py bot client, event handlers, and UI embed dispatcher
 ├── evaluate_wer.py                  # Quantitative ASR WER & latency benchmark (jiwer)
 ├── dataset_helper.py                # ASR benchmark dataset manager
@@ -224,6 +231,7 @@ discord-voice-clipper/
     ├── test_asr_engine.py
     ├── test_audio_sink.py
     ├── test_evaluation.py
+    ├── test_gui_config.py
     ├── test_integration.py
     ├── test_keyword_spotter.py
     ├── test_router_resilience.py
