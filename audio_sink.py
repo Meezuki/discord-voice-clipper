@@ -45,6 +45,17 @@ class SynchronizedRollingSink(voice_recv.AudioSink):
     def wants_opus(self) -> bool:
         return False  # Discord decodes to 16-bit PCM
 
+    def set_buffer_seconds(self, buffer_seconds: int):
+        """Updates the rolling buffer duration live while preserving recent captured frames."""
+        if buffer_seconds <= 0:
+            raise ValueError("buffer_seconds must be positive")
+        new_max_packets = int((buffer_seconds * 1000) / 20)
+        with self.lock:
+            self.buffer_seconds = buffer_seconds
+            self.max_packets = new_max_packets
+            preserved = list(self.rolling_buffer)[-new_max_packets:]
+            self.rolling_buffer = collections.deque(preserved, maxlen=new_max_packets)
+
     def cleanup(self):
         with self.lock:
             self.rolling_buffer.clear()

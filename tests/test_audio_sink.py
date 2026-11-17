@@ -92,3 +92,25 @@ def test_buffer_freezing_snapshot():
     snapshot2 = sink.get_audio_clip()
     assert len(snapshot2) > len(snapshot1)
 
+
+def test_set_buffer_seconds_resizes_and_preserves_recent_audio():
+    """Verify live buffer resizing preserves recent frames up to new capacity."""
+    sink = SynchronizedRollingSink(buffer_seconds=5)
+    user = DummyUser(302)
+
+    # 100 packets @ 20ms = 2.0 seconds (100 packets)
+    for _ in range(100):
+        sink.write(user, DummyVoiceData(generate_pcm_sine(freq=440, duration_sec=0.02)))
+
+    assert len(sink.rolling_buffer) == 100
+    # Grow to 30 minutes (1800s) -> keeps all 100 packets
+    sink.set_buffer_seconds(1800)
+    assert sink.buffer_seconds == 1800
+    assert sink.max_packets == 90000
+    assert len(sink.rolling_buffer) == 100
+
+    # Shrink to 1 second (50 packets) -> keeps latest 50 packets
+    sink.set_buffer_seconds(1)
+    assert sink.max_packets == 50
+    assert len(sink.rolling_buffer) == 50
+

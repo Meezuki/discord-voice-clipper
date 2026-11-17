@@ -5,7 +5,7 @@
 [![Discord.py](https://img.shields.io/badge/Discord.py-2.7-blurple.svg)](https://discordpy.readthedocs.io/)
 [![Faster-Whisper](https://img.shields.io/badge/ASR-faster--whisper%20(int8)-green.svg)](https://github.com/SYSTRAN/faster-whisper)
 [![ONNX KWS](https://img.shields.io/badge/KWS-Trained%20BiGRU%20ONNX%20(1.25ms)-orange.svg)](evaluation_wakeword_report.md)
-[![Tests](https://img.shields.io/badge/Tests-18%2F18%20Passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-22%2F22%20Passed-brightgreen.svg)](tests/)
 [![WER](https://img.shields.io/badge/ASR%20Benchmark%20WER-4.90%25-success.svg)](evaluation_report.md)
 
 ---
@@ -167,9 +167,11 @@ See [RECORD_INSTRUCTIONS.md](file:///d:/dev/discord-voice-clipper/RECORD_INSTRUC
 
 | Command | Description |
 |---|---|
-| `!join` | Summons the bot to your current voice channel and starts the 30-second rolling buffer. |
-| **"bot clip that"** | *(Spoken)* Hands-free wake word. Freezes the last 30 seconds, transcribes, and posts to chat. |
-| `!clip` | *(Text command)* Manually freezes the last 30 seconds and generates a clip. |
+| `!join [duration]` | Summons the bot to your voice channel (default `30s`; optional e.g. `!join 5m` or `!join 30m`). |
+| **"bot clip that"** | *(Spoken)* Hands-free wake word. Freezes the rolling window, transcribes, and dispatches. |
+| `!clip` | *(Text command)* Manually freezes the rolling buffer and generates a clip. |
+| `!duration [sec\|Xm]` | Gets or sets rolling buffer duration (`10s`–`60m`). Clips `> 30s` save `.wav` locally and attach `.txt` in chat due to upload limits. |
+| `!savelocal [on\|off]` | Saves `.wav` + `.txt` locally under `recordings/` even for `<= 30s` clips (`> 30s` always saves locally). |
 | `!lang [en\|id\|auto]` | Sets transcription language: `!lang en` (English, default), `!lang id` (Indonesian), or `!lang auto`. |
 | `!leave` | Disconnects the bot from the voice channel and safely purges all in-memory buffers. |
 
@@ -178,7 +180,7 @@ See [RECORD_INSTRUCTIONS.md](file:///d:/dev/discord-voice-clipper/RECORD_INSTRUC
 ## 🧪 Running Automated Tests
 
 ```powershell
-# Run full unit & integration test suite (18/18 tests)
+# Run full unit & integration test suite (22/22 tests)
 .\venv\Scripts\python.exe -m pytest tests/ -v
 
 # Run ASR WER benchmark
