@@ -1,238 +1,154 @@
 import os
-import re
 import json
 import time
 import logging
 import numpy as np
+import onnxruntime as ort
 
-try:
-    import vosk
-except ImportError:
-    vosk = None
+from download_model import (
+    MEL_MODEL_PATH,
+    EMB_MODEL_PATH,
+    CLASSIFIER_MODEL_PATH,
+    CLASSIFIER_CONFIG_PATH,
+)
+from wakeword_features import WakeWordFeatureExtractor, StreamingFeatureBuffer
 
 logger = logging.getLogger(__name__)
 
-def normalize_spoken_text(text: str) -> str:
-    """Strips punctuation and normalizes whitespace for robust phonetic and command matching."""
-    text = re.sub(r"[^\w\s]", " ", text.lower())
-    return re.sub(r"\s+", " ", text).strip()
-
-def is_intentional_clip_command(text: str) -> bool:
-    """
-    Evaluates whether transcribed text contains an intentional clip command (e.g. 'bot clip that', 'clip that').
-    Handles punctuation (e.g. 'Bot, clip that.') and rejects casual phrases ('paper clip', 'hair clip').
-    """
-    norm = normalize_spoken_text(text)
-    if not norm:
-        return False
-
-    # Block common conversational phrases using 'clip' as a noun/non-command
-    non_command_phrases = [
-        "paper clip",
-        "hair clip",
-        "binder clip",
-        "nail clip",
-        "clip on",
-        "magazine clip",
-        "money clip"
-    ]
-    if any(p in norm for p in non_command_phrases):
-        return False
-
-    # Positive command patterns:
-    # 'bot clip that', 'bot, clip that', 'hey bot clip that', 'bot please clip that', 'clip that', 'clip this'
-    explicit_patterns = [
-        r"\bbot\b.*?\bclip\b.*?\b(that|this|it)\b",       # 'bot clip that', 'bot, please clip that'
-        r"\b(please |can you )?clip\b.*?\b(that|this|it)\b", # 'clip that', 'please clip that', 'can you clip that'
-        r"\bclip that\b",                                # 'clip that'
-        r"\bclip this\b",                                # 'clip this'
-        r"^clip$"                                        # exact single-word command
-    ]
-    for pattern in explicit_patterns:
-        if re.search(pattern, norm):
-            return True
-
-    return False
-
-# Stage 1 Vosk candidate regex: catches potential speech commands for Whisper verification
-VOSK_CANDIDATE_REGEX = re.compile(
-    r"\b(bot|but|boat|bought|bad|pot)\b.*?\bclip|"
-    r"\bclip\b.*?\b(that|this|it)|"
-    r"\bclip that\b|\bclip this\b|"
-    r"^clip$",
-    re.IGNORECASE
-)
 
 class KeywordSpotter:
     """
-    Offline English Keyword Spotting (KWS) module using open-vocabulary Vosk
-    backed by a Two-Stage verification layer via faster-whisper.
-    Continuously listens for intentional activation phrases ('bot clip that')
-    while rejecting false alarms from conversational speech.
+    Streaming local Wake-Word / Keyword Spotting (KWS) engine for 'bot clip that'.
+    Runs a trained PyTorch-to-ONNX BiGRU classifier head on top of frozen ONNX
+    speech embeddings (melspectrogram.onnx + embedding_model.onnx) with <20 ms CPU latency.
     """
+
     def __init__(
         self,
-        model_path=None,
+        model_path: str | None = CLASSIFIER_MODEL_PATH,
+        mel_model_path: str = MEL_MODEL_PATH,
+        emb_model_path: str = EMB_MODEL_PATH,
+        config_path: str | None = None,
         target_phrases=None,
-        sample_rate=16000,
-        cooldown_seconds=8.0,
+        sample_rate: int = 16000,
+        cooldown_seconds: float = 8.0,
+        threshold: float | None = None,
+        patience_frames: int | None = None,
         trigger_callback=None,
-        asr_engine=None
+        asr_engine=None,  # Kept for signature compatibility; wake-word detection is standalone
     ):
         self.sample_rate = sample_rate
         self.cooldown_seconds = cooldown_seconds
         self.trigger_callback = trigger_callback
-        self.asr_engine = asr_engine
         self.last_trigger_time = 0.0
+        self.last_probability = 0.0
+        self.consecutive_hits = 0
 
-        self.model = None
-        self.recognizer = None
+        # Resolve model config (threshold & patience) if available
+        resolved_cfg_path = config_path
+        if resolved_cfg_path is None and model_path:
+            candidate = os.path.join(os.path.dirname(model_path), "model_config.json")
+            resolved_cfg_path = candidate if os.path.exists(candidate) else CLASSIFIER_CONFIG_PATH
 
-        if model_path and os.path.exists(model_path) and vosk:
+        cfg = {}
+        if resolved_cfg_path and os.path.exists(resolved_cfg_path):
             try:
-                vosk.SetLogLevel(-1)
-                self.model = vosk.Model(model_path)
-                # Open-vocabulary KaldiRecognizer allows natural recognition of full English sentences
-                self.recognizer = vosk.KaldiRecognizer(self.model, self.sample_rate)
-                logger.info("Vosk English KWS initialized with open vocabulary")
+                with open(resolved_cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load Vosk model: {e}")
+                logger.warning(f"Failed to read wake-word config {resolved_cfg_path}: {e}")
 
-        # Rolling buffer for Two-Stage Whisper Verification and Fallback Spotting
-        self.whisper_buffer = []
-        self.whisper_samples_target = int(self.sample_rate * 2.5)
-        self.last_whisper_check = time.time()
-        self.last_partial_logged = ""
+        self.threshold = float(threshold if threshold is not None else cfg.get("threshold", 0.5))
+        self.patience_frames = int(
+            patience_frames if patience_frames is not None else cfg.get("patience_frames", 2)
+        )
 
-    def _check_candidate(self, text: str) -> bool:
-        """Stage 1: Checks if text might be a candidate clip command."""
-        norm = normalize_spoken_text(text)
-        if not norm:
-            return False
-        # Block known non-commands immediately
-        if any(p in norm for p in ["paper clip", "hair clip", "binder clip", "nail clip", "clip on", "magazine clip", "money clip"]):
-            return False
-        if is_intentional_clip_command(norm):
-            return True
-        return bool(VOSK_CANDIDATE_REGEX.search(norm))
+        self.extractor = None
+        self.feature_buffer = None
+        self.classifier_session = None
+        self.classifier_input_name = None
 
-    def _verify_with_whisper(self, candidate_text: str) -> tuple[bool, str]:
-        """
-        Stage 2 Verification:
-        When Vosk suspects a wake word, verify against Whisper on the recent audio buffer.
-        Suppresses false alarms (e.g. Vosk hearing noise when user said something unrelated).
-        Returns tuple: (is_confirmed, final_transcription).
-        """
-        if not self.asr_engine or len(self.whisper_buffer) == 0:
-            return True, candidate_text  # Standalone mode or tests without ASR engine
+        if model_path and os.path.exists(model_path) and os.path.exists(mel_model_path) and os.path.exists(emb_model_path):
+            try:
+                self.extractor = WakeWordFeatureExtractor(mel_model_path, emb_model_path)
+                self.feature_buffer = StreamingFeatureBuffer(self.extractor)
 
-        try:
-            recent_pcm = np.concatenate(self.whisper_buffer)
-            audio_float = recent_pcm.astype(np.float32) / 32768.0
-
-            # Ignore absolute silence
-            rms = np.sqrt(np.mean(audio_float ** 2))
-            if rms < 0.002:
-                return False, ""
-
-            whisper_text, _ = self.asr_engine.transcribe(audio_float, language="en")
-            confirmed = is_intentional_clip_command(whisper_text)
-
-            if confirmed:
-                logger.info(f"✅ Two-Stage KWS Verified: Vosk candidate '{candidate_text}' confirmed by Whisper ('{whisper_text}')")
-                return True, whisper_text
-            else:
-                logger.warning(
-                    f"🛡️ Two-Stage KWS Suppressed False Alarm: Vosk heard '{candidate_text}', "
-                    f"but Whisper verified '{whisper_text}'."
+                opts = ort.SessionOptions()
+                opts.inter_op_num_threads = 1
+                opts.intra_op_num_threads = 2
+                self.classifier_session = ort.InferenceSession(
+                    model_path, sess_options=opts, providers=["CPUExecutionProvider"]
                 )
-                return False, whisper_text
-        except Exception as e:
-            logger.error(f"Error during Whisper verification: {e}")
-            return True, candidate_text
+                self.classifier_input_name = self.classifier_session.get_inputs()[0].name
+                logger.info(
+                    f"Trained ONNX Wake-Word Spotter loaded ({os.path.basename(model_path)}, "
+                    f"threshold={self.threshold:.3f}, patience={self.patience_frames})"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize ONNX wake-word spotter: {e}")
+                self.classifier_session = None
+        elif model_path:
+            logger.warning(
+                f"Trained wake-word model not found at '{model_path}'. "
+                "Voice trigger disabled until you run train_wakeword.py (manual !clip still works)."
+            )
 
-    def _check_and_trigger(self, recognized_text: str) -> bool:
-        recognized_text = recognized_text.strip()
-        if not recognized_text:
-            return False
+    @property
+    def is_ready(self) -> bool:
+        return self.classifier_session is not None and self.feature_buffer is not None
 
-        current_time = time.time()
-        if current_time - self.last_trigger_time >= self.cooldown_seconds:
-            self.last_trigger_time = current_time
-            logger.info(f"🎯 Activation phrase triggered: '{recognized_text}'")
+    def predict_window(self, embedding_window: np.ndarray) -> float:
+        """Runs ONNX classifier on a single (16, 96) embedding window -> probability [0, 1]."""
+        if self.classifier_session is None:
+            return 0.0
+        inp = np.asarray(embedding_window, dtype=np.float32)
+        if inp.ndim == 2:
+            inp = inp[None, ...]
+        out = self.classifier_session.run(None, {self.classifier_input_name: inp})[0]
+        return float(out.reshape(-1)[0])
+
+    def _check_and_trigger(self, confidence: float) -> bool:
+        now = time.time()
+        if now - self.last_trigger_time >= self.cooldown_seconds:
+            self.last_trigger_time = now
+            label = f"bot clip that (conf={confidence:.2f})"
+            logger.info(f"🎯 Wake-word triggered: {label}")
             if self.trigger_callback:
                 try:
-                    self.trigger_callback(recognized_text)
+                    self.trigger_callback(label)
                 except Exception as e:
                     logger.error(f"Error in trigger_callback: {e}")
             return True
-        else:
-            logger.debug("Activation phrase ignored due to debounce cooldown.")
+        logger.debug("Wake-word ignored due to debounce cooldown.")
         return False
 
     def process_chunk(self, pcm_bytes: bytes) -> bool:
         """
-        Receives 16 kHz 16-bit mono PCM bytes and feeds to:
-        1. Fast Vosk Open-Vocabulary KWS with Two-Stage Whisper Verification.
-        2. Rolling Whisper Spotter Fallback.
-        Returns True if activation phrase is confirmed and debounce passes.
+        Ingests 16 kHz 16-bit mono PCM bytes, extracts streaming speech embeddings
+        every 80 ms (1280 samples), and runs the trained ONNX wake-word classifier.
+        Returns True if 'bot clip that' is detected and debounce cooldown passes.
         """
-        if not pcm_bytes:
+        if not pcm_bytes or not self.is_ready:
             return False
 
-        # Continuously maintain recent rolling audio for Whisper verification
-        chunk_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
-        self.whisper_buffer.append(chunk_int16)
-        max_chunks = int(self.sample_rate * 3.0 / len(chunk_int16)) if len(chunk_int16) > 0 else 30
-        if len(self.whisper_buffer) > max_chunks:
-            self.whisper_buffer.pop(0)
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return False
 
-        # 1. Primary: Fast Vosk Open-Vocabulary KWS with Whisper Verification
-        if self.recognizer:
-            if self.recognizer.AcceptWaveform(pcm_bytes):
-                res = json.loads(self.recognizer.Result())
-                text = res.get("text", "")
-                if text:
-                    logger.info(f"🎙️ [Vosk KWS Final]: \"{text}\"")
-                if self._check_candidate(text):
-                    verified, confirmed_text = self._verify_with_whisper(text)
-                    if verified and self._check_and_trigger(confirmed_text or text):
-                        if hasattr(self.recognizer, "Reset"):
-                            self.recognizer.Reset()
-                        self.whisper_buffer.clear()
-                        return True
+        windows = self.feature_buffer.push_audio(samples)
+        for win in windows:
+            prob = self.predict_window(win)
+            self.last_probability = prob
+
+            if prob >= self.threshold:
+                self.consecutive_hits += 1
             else:
-                partial = json.loads(self.recognizer.PartialResult())
-                text = partial.get("partial", "").strip()
-                if text and text != "[unk]" and text != self.last_partial_logged:
-                    self.last_partial_logged = text
-                    logger.info(f"🎙️ [Vosk KWS Hearing]: \"{text}\"")
-                if self._check_candidate(text):
-                    verified, confirmed_text = self._verify_with_whisper(text)
-                    if verified and self._check_and_trigger(confirmed_text or text):
-                        if hasattr(self.recognizer, "Reset"):
-                            self.recognizer.Reset()
-                        self.whisper_buffer.clear()
-                        return True
+                self.consecutive_hits = 0
 
-        # 2. Secondary: Periodic Rolling Whisper Spotter Fallback (runs every 1.8s)
-        if self.asr_engine:
-            total_samples = sum(len(c) for c in self.whisper_buffer)
-            now = time.time()
-            if total_samples >= self.whisper_samples_target and (now - self.last_whisper_check >= 1.8):
-                self.last_whisper_check = now
-                audio_concat = np.concatenate(self.whisper_buffer).astype(np.float32) / 32768.0
-
-                rms = np.sqrt(np.mean(audio_concat ** 2))
-                if rms > 0.002:
-                    whisper_text, _ = self.asr_engine.transcribe(audio_concat, language="en")
-                    if whisper_text:
-                        logger.info(f"🔍 [Whisper Spotter]: \"{whisper_text}\"")
-                        if is_intentional_clip_command(whisper_text) and self._check_and_trigger(whisper_text):
-                            if self.recognizer and hasattr(self.recognizer, "Reset"):
-                                self.recognizer.Reset()
-                            self.whisper_buffer.clear()
-                            return True
+            if self.consecutive_hits >= self.patience_frames:
+                self.consecutive_hits = 0
+                if self._check_and_trigger(prob):
+                    self.feature_buffer.reset()
+                    return True
 
         return False
-

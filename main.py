@@ -14,7 +14,13 @@ import numpy as np
 from audio_sink import SynchronizedRollingSink
 from asr_engine import LocalASREngine
 from keyword_spotter import KeywordSpotter
-from download_model import EXTRACTED_PATH, ensure_vosk_model
+from download_model import (
+    MEL_MODEL_PATH,
+    EMB_MODEL_PATH,
+    CLASSIFIER_MODEL_PATH,
+    CLASSIFIER_CONFIG_PATH,
+    ensure_wakeword_backbone,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("MeetingAssistantBot")
@@ -110,7 +116,7 @@ active_languages = {}  # guild_id -> 'en' | 'id' | 'auto'
 @bot.event
 async def on_ready():
     logger.info(f"Bot connected as {bot.user} (ID: {bot.user.id})")
-    await asyncio.to_thread(ensure_vosk_model)
+    await asyncio.to_thread(ensure_wakeword_backbone)
 
 async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: 'bot clip that'"):
     """
@@ -190,13 +196,14 @@ async def join(ctx):
     # Store origin text channel for minutes dispatch
     active_text_channels[guild_id] = ctx.channel
 
-    # Two-Stage Keyword Spotter: Open-Vocabulary Vosk + Faster-Whisper Verification
+    # Trained ONNX Wake-Word Spotter (Frozen Speech Embeddings + Custom BiGRU Classifier)
     spotter = KeywordSpotter(
-        model_path=EXTRACTED_PATH,
-        target_phrases=["bot clip that", "clip that", "bot clip this", "please clip that"],
+        model_path=CLASSIFIER_MODEL_PATH,
+        mel_model_path=MEL_MODEL_PATH,
+        emb_model_path=EMB_MODEL_PATH,
+        config_path=CLASSIFIER_CONFIG_PATH,
         cooldown_seconds=8.0,
         trigger_callback=make_keyword_callback(guild_id),
-        asr_engine=asr_engine
     )
     active_spotters[guild_id] = spotter
 

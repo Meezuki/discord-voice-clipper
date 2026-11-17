@@ -1,143 +1,86 @@
-import time
 import numpy as np
-import pytest
 from unittest.mock import MagicMock
 from keyword_spotter import KeywordSpotter
 
-def test_keyword_spotter_debounce():
-    """Verify that debounce locks the trigger for cooldown_seconds after wake word detection."""
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
-    spotter.recognizer = MagicMock()
 
-    # Simulate detecting "bot clip that"
-    spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "please bot clip that"}'
+def _make_mock_spotter(probs_sequence, threshold=0.5, patience_frames=2, cooldown_seconds=2.0, callback=None):
+    spotter = KeywordSpotter(
+        model_path=None,
+        threshold=threshold,
+        patience_frames=patience_frames,
+        cooldown_seconds=cooldown_seconds,
+        trigger_callback=callback,
+    )
+    spotter.classifier_session = MagicMock()
+    spotter.classifier_input_name = "embeddings"
+    spotter.feature_buffer = MagicMock()
+    # Each process_chunk call emits one dummy (16, 96) window
+    spotter.feature_buffer.push_audio.return_value = [np.zeros((16, 96), dtype=np.float32)]
 
-    dummy_pcm = b"\x00" * 3200 # 100ms audio chunk
-    detected1 = spotter.process_chunk(dummy_pcm)
-    assert detected1 is True
+    prob_iter = iter(probs_sequence)
+    spotter.classifier_session.run.side_effect = lambda *args, **kwargs: [np.array([[next(prob_iter)]], dtype=np.float32)]
+    return spotter
 
-    # Immediate subsequent call within debounce cooldown must return False
-    detected2 = spotter.process_chunk(dummy_pcm)
-    assert detected2 is False
 
-    # After cooldown expires
-    spotter.last_trigger_time -= 2.1
-    detected3 = spotter.process_chunk(dummy_pcm)
-    assert detected3 is True
-
-def test_keyword_spotter_bot_word_alone_does_not_trigger():
-    """Verify that saying just 'bot' or 'paper clip' does NOT trigger the wake word."""
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
-    spotter.recognizer = MagicMock()
-
-    spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "hey bot"}'
-
-    dummy_pcm = b"\x00" * 3200
-    detected = spotter.process_chunk(dummy_pcm)
-    assert detected is False
-
-    # Also non-command 'paper clip' should not trigger
-    spotter.recognizer.Result.return_value = '{"text": "bring me a paper clip"}'
+def test_keyword_spotter_missing_model_graceful_noop():
+    """Verify missing ONNX model disables voice trigger gracefully without crashing."""
+    spotter = KeywordSpotter(model_path="nonexistent_model.onnx")
+    assert spotter.is_ready is False
+    dummy_pcm = (np.ones(1600, dtype=np.int16) * 500).tobytes()
     assert spotter.process_chunk(dummy_pcm) is False
 
-def test_keyword_spotter_clip_that_trigger():
-    """Verify that intentional phrase 'bot clip that' triggers the wake word."""
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
-    spotter.recognizer = MagicMock()
 
-    spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "bot clip that"}'
+def test_keyword_spotter_patience_and_trigger():
+    """Verify consecutive frames >= threshold (patience=2) trigger once and invoke callback."""
+    triggered = []
+    spotter = _make_mock_spotter(
+        probs_sequence=[0.20, 0.85, 0.91],
+        threshold=0.5,
+        patience_frames=2,
+        cooldown_seconds=8.0,
+        callback=lambda label: triggered.append(label),
+    )
+    pcm = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
 
-    dummy_pcm = b"\x00" * 3200
-    detected = spotter.process_chunk(dummy_pcm)
-    assert detected is True
-
-def test_keyword_spotter_whisper_fallback():
-    """Verify that when Vosk returns unk or empty, Whisper spotter fallback catches 'bot clip that'."""
-    mock_asr = MagicMock()
-    mock_asr.transcribe.return_value = ("hello everyone please bot clip that now", 0.05)
-
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
-    spotter.recognizer = MagicMock()
-    spotter.recognizer.AcceptWaveform.return_value = False
-    spotter.recognizer.PartialResult.return_value = '{"partial": "[unk]"}'
-
-    # Force last_whisper_check to past
-    spotter.last_whisper_check = 0.0
-
-    # Ingest enough audio to exceed whisper_samples_target (e.g. 2.5s with non-zero sound)
-    detected = False
-    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
-    for _ in range(26):
-        if spotter.process_chunk(chunk):
-            detected = True
-            break
-
-    assert detected is True
-    mock_asr.transcribe.assert_called()
-
-def test_keyword_spotter_ignores_non_trigger_words():
-    """Verify that non-trigger sentences do not fire."""
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0)
-    spotter.recognizer = MagicMock()
-
-    spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "good morning everyone let us begin"}'
-
-    dummy_pcm = b"\x00" * 3200
-    detected = spotter.process_chunk(dummy_pcm)
-    assert detected is False
-
-def test_keyword_spotter_two_stage_verification_rejects_false_positive():
-    """Verify that if Vosk misrecognizes conversational speech as a trigger, Whisper verification rejects it."""
-    mock_asr = MagicMock()
-    # Whisper reveals user actually said conversational speech without any clip command
-    mock_asr.transcribe.return_value = ("what is listening in the voice channel general", 0.05)
-
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
-    spotter.recognizer = MagicMock()
-    spotter.recognizer.AcceptWaveform.return_value = True
-    # Vosk erroneously heard 'clip'
-    spotter.recognizer.Result.return_value = '{"text": "clip"}'
-
-    # Provide audible chunk so verification evaluates
-    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
-    detected = spotter.process_chunk(chunk)
-
-    assert detected is False  # Suppressed by Whisper verification!
-    mock_asr.transcribe.assert_called()
-
-def test_keyword_spotter_two_stage_verification_confirms_true_positive():
-    """Verify that if Vosk detects trigger and Whisper confirms it, the trigger fires."""
-    mock_asr = MagicMock()
-    mock_asr.transcribe.return_value = ("please bot clip that meeting", 0.05)
-
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
-    spotter.recognizer = MagicMock()
-    spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "bot clip that"}'
-
-    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
-    detected = spotter.process_chunk(chunk)
-
-    assert detected is True  # Confirmed!
-    mock_asr.transcribe.assert_called()
-
-def test_keyword_spotter_whisper_punctuation_handling():
-    """Verify that Whisper output containing punctuation like 'Bot, clip that.' triggers properly."""
-    mock_asr = MagicMock()
-    mock_asr.transcribe.return_value = ("Bot, clip that.", 0.05)
-
-    spotter = KeywordSpotter(model_path=None, cooldown_seconds=2.0, asr_engine=mock_asr)
-    spotter.recognizer = MagicMock()
-    spotter.recognizer.AcceptWaveform.return_value = True
-    spotter.recognizer.Result.return_value = '{"text": "bot clip that"}'
-
-    chunk = (np.ones(1600, dtype=np.int16) * 5000).tobytes()
-    detected = spotter.process_chunk(chunk)
-
-    assert detected is True
+    assert spotter.process_chunk(pcm) is False  # 0.20 < 0.5
+    assert spotter.process_chunk(pcm) is False  # 0.85 >= 0.5 (hit 1/2)
+    assert spotter.process_chunk(pcm) is True   # 0.91 >= 0.5 (hit 2/2 -> trigger!)
+    assert len(triggered) == 1
+    assert "bot clip that" in triggered[0]
 
 
+def test_keyword_spotter_resets_patience_on_drop():
+    """Verify a single transient spike below patience_frames does NOT trigger."""
+    spotter = _make_mock_spotter(
+        probs_sequence=[0.88, 0.30, 0.89],
+        threshold=0.5,
+        patience_frames=2,
+    )
+    pcm = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+
+    assert spotter.process_chunk(pcm) is False  # hit 1
+    assert spotter.process_chunk(pcm) is False  # drop -> reset to 0
+    assert spotter.process_chunk(pcm) is False  # hit 1 again, not 2
+
+
+def test_keyword_spotter_debounce_cooldown():
+    """Verify debounce blocks rapid re-triggers until cooldown_seconds elapses."""
+    spotter = _make_mock_spotter(
+        probs_sequence=[0.95, 0.96, 0.97, 0.98, 0.99, 0.99],
+        threshold=0.5,
+        patience_frames=2,
+        cooldown_seconds=5.0,
+    )
+    pcm = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+
+    assert spotter.process_chunk(pcm) is False
+    assert spotter.process_chunk(pcm) is True   # First trigger
+
+    # Immediate subsequent hits within cooldown must return False
+    assert spotter.process_chunk(pcm) is False
+    assert spotter.process_chunk(pcm) is False
+
+    # Simulate cooldown expiry
+    spotter.last_trigger_time -= 5.5
+    assert spotter.process_chunk(pcm) is False  # hit 1
+    assert spotter.process_chunk(pcm) is True   # hit 2 -> Second trigger
