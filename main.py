@@ -148,6 +148,8 @@ except ValueError:
     DEFAULT_BUFFER_SECONDS = 30
 
 DEFAULT_SAVE_LOCALLY = os.getenv("SAVE_LOCALLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+_env_lang = os.getenv("DEFAULT_LANGUAGE", "en").strip().lower()
+DEFAULT_LANGUAGE = _env_lang if _env_lang in {"en", "id", "auto"} else "en"
 RECORDINGS_DIR = os.getenv(
     "RECORDINGS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 )
@@ -233,12 +235,13 @@ async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: '
         return
 
     dur_label = format_duration_label(buffer_seconds)
+    logger.info(f"Transcribing {dur_label} clip ({trigger_source})...")
     processing_msg = await text_channel.send(
         f"⏳ **Freezing {dur_label} buffer & transcribing locally...**"
     )
 
-    # Run local multilingual ASR with guild-selected language (defaults to 'en', or 'id' / 'auto')
-    guild_lang = active_languages.get(guild_id, "en")
+    # Run local multilingual ASR with guild-selected language (defaults to DEFAULT_LANGUAGE)
+    guild_lang = active_languages.get(guild_id, DEFAULT_LANGUAGE)
     lang_param = None if guild_lang == "auto" else guild_lang
     text, latency = await asyncio.to_thread(asr_engine.transcribe, audio_data, lang_param)
 
@@ -300,6 +303,19 @@ async def process_and_send_notula(guild_id: int, trigger_source: str = "Voice: '
         pass
 
     await text_channel.send(embed=embed, file=file_attachment)
+    dest_summary = (
+        f"Local: {_format_local_path(saved_paths[0])}"
+        if exceeds_discord_limit and saved_paths
+        else (
+            f"Discord #{text_channel.name} + Local: {_format_local_path(saved_paths[0])}"
+            if saved_paths
+            else f"Discord #{text_channel.name}"
+        )
+    )
+    clean_text = " ".join(text.splitlines()).strip()
+    logger.info(
+        f"[CLIP_EVENT] time={time_str} | trigger={trigger_source} | latency={latency:.2f}s | dest={dest_summary} | text={clean_text}"
+    )
     logger.info(f"Voice clip dispatched to #{text_channel.name} (Guild: {guild_id}, duration={buffer_seconds}s, local={save_local})")
 
 def make_keyword_callback(guild_id: int):
@@ -487,11 +503,63 @@ async def leave(ctx):
         if guild_id in active_save_local:
             del active_save_local[guild_id]
         await ctx.send("👋 Bot left the voice channel and cleared all audio buffers.")
+        logger.info(f"Disconnected from voice channel in guild {guild_id}.")
     else:
         await ctx.send("Bot is not in a voice channel.")
 
 
+async def _graceful_shutdown():
+    """Disconnects all active voice clients, clears buffers, and closes the Discord bot."""
+    logger.info("Graceful shutdown requested; disconnecting Discord client...")
+    for vc in list(bot.voice_clients):
+        try:
+            await vc.disconnect(force=True)
+        except Exception as e:
+            logger.debug(f"Error disconnecting voice client during shutdown: {e}")
+
+    for sink in list(active_sinks.values()):
+        try:
+            sink.cleanup()
+        except Exception:
+            pass
+    active_sinks.clear()
+    active_spotters.clear()
+    active_text_channels.clear()
+    active_languages.clear()
+    active_durations.clear()
+    active_save_local.clear()
+
+    if not bot.is_closed():
+        try:
+            await bot.change_presence(status=discord.Status.offline)
+        except Exception as e:
+            logger.debug(f"Error setting offline presence during shutdown: {e}")
+        await bot.close()
+
+
+def _start_gui_control_listener():
+    """Listens on stdin for 'STOP' (or EOF) when launched via gui.py --gui-managed."""
+    def _listen():
+        try:
+            for raw in sys.stdin:
+                if raw.strip().upper() == "STOP":
+                    break
+        except Exception:
+            pass
+
+        loop = getattr(bot, "loop", None)
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_graceful_shutdown(), loop)
+        else:
+            os._exit(0)
+
+    threading.Thread(target=_listen, name="GUIControlListener", daemon=True).start()
+
+
 if __name__ == "__main__":
+    import sys
     if not TOKEN:
         print("WARNING: DISCORD_TOKEN is missing in .env file!")
+    if "--gui-managed" in sys.argv:
+        _start_gui_control_listener()
     bot.run(TOKEN)
